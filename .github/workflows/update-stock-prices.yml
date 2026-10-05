@@ -1,1 +1,113 @@
+name: Update AI Stock Prices
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update NVDA price
+        env:
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: app4h1p2LThxhoWsu
+        run: |
+          node <<'NODE'
+          const apiKey = process.env.ALPHA_VANTAGE_API_KEY;
+          const airtableToken = process.env.AIRTABLE_TOKEN;
+          const baseId = process.env.AIRTABLE_BASE_ID;
+
+          const ticker = "NVDA";
+          const tableName = "Stock Tracker";
+
+          async function main() {
+            // Get the latest NVDA price from Alpha Vantage
+            const priceUrl =
+              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`;
+
+            const priceResponse = await fetch(priceUrl);
+
+            if (!priceResponse.ok) {
+              throw new Error(`Alpha Vantage HTTP error: ${priceResponse.status}`);
+            }
+
+            const priceData = await priceResponse.json();
+            const quote = priceData["Global Quote"];
+
+            if (!quote || !quote["05. price"]) {
+              console.log(JSON.stringify(priceData, null, 2));
+              throw new Error("No NVDA price returned by Alpha Vantage.");
+            }
+
+            const currentPrice = Number(quote["05. price"]);
+
+            if (!Number.isFinite(currentPrice)) {
+              throw new Error("Invalid NVDA price.");
+            }
+
+            console.log(`NVDA current price: $${currentPrice}`);
+
+            // Find NVDA in Airtable
+            const filter = encodeURIComponent(`{Ticker}="${ticker}"`);
+
+            const recordsUrl =
+              `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}?filterByFormula=${filter}`;
+
+            const recordsResponse = await fetch(recordsUrl, {
+              headers: {
+                Authorization: `Bearer ${airtableToken}`
+              }
+            });
+
+            if (!recordsResponse.ok) {
+              const errorText = await recordsResponse.text();
+              throw new Error(
+                `Airtable lookup failed: ${recordsResponse.status} ${errorText}`
+              );
+            }
+
+            const recordsData = await recordsResponse.json();
+
+            if (!recordsData.records || recordsData.records.length === 0) {
+              throw new Error("NVDA was not found in Airtable.");
+            }
+
+            const record = recordsData.records[0];
+
+            // Update Current Price and Last Updated
+            const updateUrl =
+              `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}/${record.id}`;
+
+            const updateResponse = await fetch(updateUrl, {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${airtableToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                fields: {
+                  "Current Price (USD)": currentPrice,
+                  "Last Updated": new Date().toISOString()
+                }
+              })
+            });
+
+            if (!updateResponse.ok) {
+              const errorText = await updateResponse.text();
+              throw new Error(
+                `Airtable update failed: ${updateResponse.status} ${errorText}`
+              );
+            }
+
+            console.log("Airtable updated successfully.");
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE

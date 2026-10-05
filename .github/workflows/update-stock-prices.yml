@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Update NVDA price
+      - name: Update all stock prices
         env:
           ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
@@ -20,90 +20,148 @@ jobs:
           const apiKey = process.env.ALPHA_VANTAGE_API_KEY;
           const airtableToken = process.env.AIRTABLE_TOKEN;
           const baseId = process.env.AIRTABLE_BASE_ID;
-
-          const ticker = "NVDA";
           const tableName = "Stock Tracker";
 
-          async function main() {
-            // Get the latest NVDA price from Alpha Vantage
-            const priceUrl =
-              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${ticker}&apikey=${apiKey}`;
+          async function getAllRecords() {
+            let records = [];
+            let offset = null;
 
-            const priceResponse = await fetch(priceUrl);
+            do {
+              let url =
+                `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`;
 
-            if (!priceResponse.ok) {
-              throw new Error(`Alpha Vantage HTTP error: ${priceResponse.status}`);
-            }
-
-            const priceData = await priceResponse.json();
-            const quote = priceData["Global Quote"];
-
-            if (!quote || !quote["05. price"]) {
-              console.log(JSON.stringify(priceData, null, 2));
-              throw new Error("No NVDA price returned by Alpha Vantage.");
-            }
-
-            const currentPrice = Number(quote["05. price"]);
-
-            if (!Number.isFinite(currentPrice)) {
-              throw new Error("Invalid NVDA price.");
-            }
-
-            console.log(`NVDA current price: $${currentPrice}`);
-
-            // Find NVDA in Airtable
-            const filter = encodeURIComponent(`{Ticker}="${ticker}"`);
-
-            const recordsUrl =
-              `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}?filterByFormula=${filter}`;
-
-            const recordsResponse = await fetch(recordsUrl, {
-              headers: {
-                Authorization: `Bearer ${airtableToken}`
+              if (offset) {
+                url += `?offset=${encodeURIComponent(offset)}`;
               }
-            });
 
-            if (!recordsResponse.ok) {
-              const errorText = await recordsResponse.text();
+              const response = await fetch(url, {
+                headers: {
+                  Authorization: `Bearer ${airtableToken}`
+                }
+              });
+
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(
+                  `Airtable lookup failed: ${response.status} ${errorText}`
+                );
+              }
+
+              const data = await response.json();
+
+              records = records.concat(data.records || []);
+              offset = data.offset || null;
+
+            } while (offset);
+
+            return records;
+          }
+
+          async function getPrice(ticker) {
+            const priceUrl =
+              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${apiKey}`;
+
+            const response = await fetch(priceUrl);
+
+            if (!response.ok) {
               throw new Error(
-                `Airtable lookup failed: ${recordsResponse.status} ${errorText}`
+                `Alpha Vantage HTTP error for ${ticker}: ${response.status}`
               );
             }
 
-            const recordsData = await recordsResponse.json();
+            const data = await response.json();
+            const quote = data["Global Quote"];
 
-            if (!recordsData.records || recordsData.records.length === 0) {
-              throw new Error("NVDA was not found in Airtable.");
+            if (!quote || !quote["05. price"]) {
+              console.log(`No price returned for ${ticker}:`);
+              console.log(JSON.stringify(data, null, 2));
+              return null;
             }
 
-            const record = recordsData.records[0];
+            const price = Number(quote["05. price"]);
 
-            // Update Current Price and Last Updated
+            if (!Number.isFinite(price)) {
+              throw new Error(`Invalid price returned for ${ticker}.`);
+            }
+
+            return price;
+          }
+
+          async function updateRecord(record, currentPrice) {
             const updateUrl =
               `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}/${record.id}`;
 
-            const updateResponse = await fetch(updateUrl, {
+            const fields = {
+              "Current Price (USD)": currentPrice,
+              "Last Updated": new Date().toISOString()
+            };
+
+            const existingDateAddedPrice =
+              record.fields["Date Added Price (USD)"];
+
+            if (
+              existingDateAddedPrice === undefined ||
+              existingDateAddedPrice === null ||
+              existingDateAddedPrice === ""
+            ) {
+              fields["Date Added Price (USD)"] = currentPrice;
+            }
+
+            const response = await fetch(updateUrl, {
               method: "PATCH",
               headers: {
                 Authorization: `Bearer ${airtableToken}`,
                 "Content-Type": "application/json"
               },
-              body: JSON.stringify({
-                fields: {
-                  "Current Price (USD)": currentPrice,
-                  "Last Updated": new Date().toISOString()
-                }
-              })
+              body: JSON.stringify({ fields })
             });
 
-            if (!updateResponse.ok) {
-              const errorText = await updateResponse.text();
+            if (!response.ok) {
+              const errorText = await response.text();
               throw new Error(
-                `Airtable update failed: ${updateResponse.status} ${errorText}`
+                `Airtable update failed for ${record.fields.Ticker}: ${response.status} ${errorText}`
               );
             }
+          }
 
-            console.log("Airtable updated successfully.");
+          async function main() {
+            const records = await getAllRecords();
+
+            console.log(`Found ${records.length} stock(s) in Airtable.`);
+
+            for (const record of records) {
+              const ticker = record.fields.Ticker;
+
+              if (!ticker) {
+                console.log(`Skipping record ${record.id}: no ticker.`);
+                continue;
+              }
+
+              console.log(`Updating ${ticker}...`);
+
+              try {
+                const currentPrice = await getPrice(ticker);
+
+                if (currentPrice === null) {
+                  console.log(`Skipping ${ticker}: no price available.`);
+                  continue;
+                }
+
+                console.log(`${ticker} current price: $${currentPrice}`);
+
+                await updateRecord(record, currentPrice);
+
+                console.log(`${ticker} updated successfully.`);
+
+              } catch (error) {
+                console.error(`Error updating ${ticker}:`, error.message);
+              }
+
+              // Small pause between API requests
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+
+            console.log("Finished updating all stocks.");
           }
 
           main().catch(error => {

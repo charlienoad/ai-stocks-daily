@@ -57,15 +57,65 @@ jobs:
             return records;
           }
 
-          async function getPrice(ticker) {
+          async function searchSymbol(keyword, market) {
+            const url =
+              `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(keyword)}&apikey=${apiKey}`;
+
+            const response = await fetch(url);
+
+            if (!response.ok) {
+              throw new Error(
+                `Alpha Vantage symbol search failed: ${response.status}`
+              );
+            }
+
+            const data = await response.json();
+
+            if (!data.bestMatches || data.bestMatches.length === 0) {
+              return null;
+            }
+
+            const matches = data.bestMatches;
+
+            // Try to find the correct exchange based on the Airtable Market field.
+            const marketMap = {
+              "NASDAQ": ["NASDAQ"],
+              "NYSE": ["NYSE"],
+              "LSE": ["LONDON STOCK EXCHANGE", "LSE"],
+              "Tokyo Stock Exchange": ["TOKYO"],
+              "Korea Exchange": ["KOREA"],
+              "SIX Swiss Exchange": ["SWISS"],
+              "HKEX": ["HONG KONG"]
+            };
+
+            const wantedMarkets = marketMap[market] || [];
+
+            for (const match of matches) {
+              const exchange =
+                String(match["4. region"] || "").toUpperCase();
+
+              const matched = wantedMarkets.some(
+                wanted => exchange.includes(wanted)
+              );
+
+              if (matched) {
+                return match["1. symbol"];
+              }
+            }
+
+            // If no exchange match is found, use the first best match.
+            return matches[0]["1. symbol"];
+          }
+
+          async function getPrice(symbol) {
             const priceUrl =
-              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}&apikey=${apiKey}`;
+              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(symbol)}&apikey=${apiKey}`;
 
             const response = await fetch(priceUrl);
 
             if (!response.ok) {
               throw new Error(
-                `Alpha Vantage HTTP error for ${ticker}: ${response.status}`
+                `Alpha Vantage price request failed: ${response.status}`
               );
             }
 
@@ -73,15 +123,13 @@ jobs:
             const quote = data["Global Quote"];
 
             if (!quote || !quote["05. price"]) {
-              console.log(`No price returned for ${ticker}:`);
-              console.log(JSON.stringify(data, null, 2));
               return null;
             }
 
             const price = Number(quote["05. price"]);
 
             if (!Number.isFinite(price)) {
-              throw new Error(`Invalid price returned for ${ticker}.`);
+              return null;
             }
 
             return price;
@@ -118,8 +166,9 @@ jobs:
 
             if (!response.ok) {
               const errorText = await response.text();
+
               throw new Error(
-                `Airtable update failed for ${record.fields.Ticker}: ${response.status} ${errorText}`
+                `Airtable update failed: ${response.status} ${errorText}`
               );
             }
           }
@@ -131,37 +180,85 @@ jobs:
 
             for (const record of records) {
               const ticker = record.fields.Ticker;
+              const market = record.fields.Market;
+              const company = record.fields.Company;
 
               if (!ticker) {
-                console.log(`Skipping record ${record.id}: no ticker.`);
+                console.log(`Skipping ${company || record.id}: no ticker.`);
                 continue;
               }
 
-              console.log(`Updating ${ticker}...`);
+              console.log(
+                `Processing ${company || ticker} (${ticker}) - ${market}`
+              );
 
               try {
-                const currentPrice = await getPrice(ticker);
+                let alphaSymbol = ticker;
+
+                // If the ticker already contains an exchange suffix,
+                // use it directly.
+                if (!ticker.includes(".")) {
+
+                  // US markets generally work with the plain ticker.
+                  if (
+                    market !== "NASDAQ" &&
+                    market !== "NYSE"
+                  ) {
+                    const searchedSymbol =
+                      await searchSymbol(
+                        ticker,
+                        market
+                      );
+
+                    if (searchedSymbol) {
+                      alphaSymbol = searchedSymbol;
+                    }
+                  }
+                }
+
+                console.log(
+                  `Alpha Vantage symbol: ${alphaSymbol}`
+                );
+
+                const currentPrice =
+                  await getPrice(alphaSymbol);
 
                 if (currentPrice === null) {
-                  console.log(`Skipping ${ticker}: no price available.`);
+                  console.log(
+                    `No price returned for ${company || ticker}.`
+                  );
                   continue;
                 }
 
-                console.log(`${ticker} current price: $${currentPrice}`);
+                console.log(
+                  `${ticker} current price: $${currentPrice}`
+                );
 
-                await updateRecord(record, currentPrice);
+                await updateRecord(
+                  record,
+                  currentPrice
+                );
 
-                console.log(`${ticker} updated successfully.`);
+                console.log(
+                  `${ticker} updated successfully.`
+                );
 
               } catch (error) {
-                console.error(`Error updating ${ticker}:`, error.message);
+                console.error(
+                  `Error updating ${ticker}:`,
+                  error.message
+                );
               }
 
-              // Small pause between API requests
-              await new Promise(resolve => setTimeout(resolve, 1500));
+              // Small pause between requests.
+              await new Promise(
+                resolve => setTimeout(resolve, 1500)
+              );
             }
 
-            console.log("Finished updating all stocks.");
+            console.log(
+              "Finished updating all stocks."
+            );
           }
 
           main().catch(error => {
